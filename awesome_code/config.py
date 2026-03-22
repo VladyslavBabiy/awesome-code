@@ -8,6 +8,9 @@ DEFAULTS = {
     "api_key": "",
     "model": "anthropic/claude-sonnet-4",
     "base_url": "https://openrouter.ai/api/v1",
+    "ollama_url": "http://localhost:11434",
+    "embed_model": "nomic-embed-text",
+    "auto_index": False,
 }
 
 

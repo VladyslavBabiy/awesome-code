@@ -3,8 +3,13 @@ from awesome_code.tools.read_file import ReadFileTool
 from awesome_code.tools.write_file import WriteFileTool
 from awesome_code.tools.bash import BashTool
 from awesome_code.tools.list_dir import ListDirTool
+from awesome_code.tools.index_codebase import IndexCodebaseTool
+from awesome_code.tools.search_codebase import SearchCodebaseTool
 
-_BUILTIN_TOOLS = [ReadFileTool(), WriteFileTool(), BashTool(), ListDirTool()]
+_BUILTIN_TOOLS = [
+    ReadFileTool(), WriteFileTool(), BashTool(), ListDirTool(),
+    IndexCodebaseTool(), SearchCodebaseTool(),
+]
 
 ALL_TOOLS: list[BaseTool] = list(_BUILTIN_TOOLS)
 TOOLS_BY_NAME: dict[str, BaseTool] = {t.name: t for t in ALL_TOOLS}
