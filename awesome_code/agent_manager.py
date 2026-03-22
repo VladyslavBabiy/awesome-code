@@ -53,7 +53,7 @@ def _build_system_prompt(agent_md: str) -> str:
     )
 
 
-def spawn(agent_name: str, task: str, agent_md: str) -> str:
+async def spawn(agent_name: str, task: str, agent_md: str) -> str:
     """Spawn a sub-agent as an async task. Returns task_id."""
     running = sum(1 for t in _tasks.values() if t.status == AgentStatus.RUNNING)
     if running >= MAX_CONCURRENT:
@@ -61,6 +61,14 @@ def spawn(agent_name: str, task: str, agent_md: str) -> str:
             f"Max concurrent sub-agents ({MAX_CONCURRENT}) reached. "
             "Wait for a running agent to finish."
         )
+
+    # SubagentSpawn hook — can block or modify task
+    from awesome_code.hooks import on_subagent_spawn, HookDecision
+    spawn_result = await on_subagent_spawn(agent_name, task)
+    if spawn_result.decision == HookDecision.BLOCK:
+        raise RuntimeError(f"Subagent spawn blocked by hook: {spawn_result.reason}")
+    if spawn_result.decision == HookDecision.MODIFY and spawn_result.updated_input:
+        task = spawn_result.updated_input.get("task", task)
 
     task_id = uuid.uuid4().hex[:8]
     system_prompt = _build_system_prompt(agent_md)
@@ -98,16 +106,25 @@ def spawn(agent_name: str, task: str, agent_md: str) -> str:
     entry.asyncio_task = asyncio_task
     _tasks[task_id] = entry
 
+    async def _fire_complete_hook(status: str, result_text: str):
+        from awesome_code.hooks import on_subagent_complete
+        try:
+            await on_subagent_complete(agent_name, task, status, result_text)
+        except Exception:
+            pass  # Never let hook errors break agent completion
+
     def _on_done(fut: asyncio.Task):
         prefix = f"  [magenta]\\[{agent_name}][/magenta]"
         try:
             entry.result = fut.result()
             entry.status = AgentStatus.COMPLETED
             _console.print(f"{prefix} [green]✓ done[/green]")
+            asyncio.ensure_future(_fire_complete_hook("completed", entry.result))
         except Exception as e:
             entry.error = str(e)
             entry.status = AgentStatus.FAILED
             _console.print(f"{prefix} [red]✗ failed: {e}[/red]")
+            asyncio.ensure_future(_fire_complete_hook("failed", str(e)))
 
     asyncio_task.add_done_callback(_on_done)
 

@@ -13,119 +13,288 @@ A CLI tool that lets you pair-program with LLMs right from your terminal — ask
 - **MCP Support** — connect external MCP servers for additional tools
 - **Skills** — reusable prompt templates loaded from markdown files
 - **Sub-Agents** — spawn specialized agents that work asynchronously with clean context
+- **Hooks** — user-defined shell commands that react to agent lifecycle events (block, validate, log)
 - **Memory Bank** — persistent project context that survives across sessions (`/init`)
 - **Multi-Model** — works with Claude, GPT-4, Gemini, DeepSeek, Llama and more via OpenRouter
 
 ---
 
-## Memory Bank
+## Hooks
 
-### The Problem
-
-Every time you start a new session with the agent, it knows nothing about your project. It has to re-discover the tech stack, project structure, and conventions from scratch — either by you explaining it, or by the agent spending tool calls to explore.
-
-This is wasteful. The project doesn't change that much between sessions. If the agent could **remember** what it learned, it would be useful from the very first message.
-
-### What is Memory Bank?
-
-Memory Bank is a persistent project description stored in `.awesome-code/memory.md`. When you run `/init`, the agent analyzes your project — reads config files, scans the directory tree, checks git history — and writes a structured summary. This summary is automatically injected into the system prompt on every subsequent session.
-
-```
-Session 1:  /init → agent analyzes project → writes .awesome-code/memory.md
-Session 2:  agent starts with project context already loaded
-Session 3:  agent starts with project context already loaded
-...
-Project changes significantly?  /init again → memory updated
-```
+Hooks are user-defined shell commands that execute at specific points in the agent lifecycle. They let you validate, block, modify, or react to agent actions without changing the source code.
 
 ### How It Works
 
-#### 1. Initialize
-
-Run `/init` in your project directory. The agent will:
-
-1. `list_dir` — scan the project structure
-2. `read_file` — read config files (pyproject.toml, package.json, pom.xml, etc.)
-3. `bash` — check `git remote -v` and `git log --oneline -5`
-4. `write_file` — write the analysis to `.awesome-code/memory.md`
-
-#### 2. Memory File Format
-
-The generated file follows a fixed structure:
-
-```markdown
-# Project: awesome-code
-
-## Overview
-Terminal-based AI coding assistant built for educational purposes.
-
-## Tech Stack
-- Python 3.10+, AsyncOpenAI, Rich, prompt_toolkit, MCP SDK, NumPy
-
-## Architecture
-- Entry point: cli.py (REPL loop)
-- Agent loop: agent.py (run, run_background, run_in_context)
-- LLM client: llm.py (AsyncOpenAI with streaming)
-...
-
-## Key Files
-- cli.py — REPL loop, commands, input handling
-- agent.py — agent execution loop with tool calls
-...
-
-## Conventions
-- No Lombok, no unnecessary abstractions
-- Tools follow BaseTool abstract class pattern
-...
+```
+User submits message
+        │
+        ▼
+  PrePromptSubmit hook ──── block? → message discarded
+        │ allow/modify
+        ▼
+  Agent calls LLM
+        │
+        ▼
+  PostResponse hook
+        │
+        ▼
+  Agent calls tool
+        │
+  PreToolUse hook ──── block? → tool skipped
+        │ allow/modify
+        ▼
+  Tool executes
+        │
+        ▼
+  PostToolUse hook ──── modify? → result changed
 ```
 
-#### 3. Automatic Loading
+### Events
 
-On every session, `llm.py` checks for `.awesome-code/memory.md`. If found, its content is appended to the system prompt under "Project Memory Bank". The agent sees this context before any user message.
+| Event | When it fires | Can block? |
+|-------|---------------|-----------|
+| `SessionStart` | REPL starts | Yes |
+| `SessionEnd` | REPL exits | No |
+| `PreToolUse` | Before tool execution | Yes |
+| `PostToolUse` | After tool execution | No (can modify result) |
+| `PrePromptSubmit` | Before prompt is sent to LLM | Yes |
+| `PostResponse` | After LLM responds | No |
+| `SubagentSpawn` | When a sub-agent is spawned | Yes |
+| `SubagentComplete` | When a sub-agent finishes | No |
 
-#### 4. Re-initialization
+### Configuration
 
-Run `/init` again to re-analyze. The agent overwrites the existing memory file with fresh analysis. Useful after major refactors or dependency changes.
+Hooks are configured in `~/.awesome-code/config.json` under the `hooks` key:
+
+```json
+{
+  "hooks": {
+    "EventName": [
+      {
+        "matcher": "regex_pattern",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "shell_command_here",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+- **matcher** — regex pattern to filter events (empty `""` = match all). For `PreToolUse`/`PostToolUse` it matches the tool name, for `SubagentSpawn` — agent name, for `PrePromptSubmit` — prompt text
+- **type** — currently only `"command"` (shell command)
+- **timeout** — timeout in seconds (default 10)
+
+### Protocol
+
+Hook receives JSON on **stdin**:
+
+```json
+{
+  "event": "PreToolUse",
+  "session_id": "a1b2c3d4e5f6",
+  "cwd": "/path/to/project",
+  "tool_name": "bash",
+  "tool_input": { "command": "rm -rf /" }
+}
+```
+
+Hook responds via **stdout** (JSON) and **exit code**:
+
+| Exit code | Behavior |
+|-----------|----------|
+| `0` | Success — parses stdout JSON for decision |
+| `2` | Block — operation is prevented |
+| Other | Non-blocking error — warning logged, execution continues |
+
+Stdout JSON format:
+
+```json
+{
+  "decision": "allow|block|modify",
+  "reason": "human-readable reason",
+  "updatedInput": { "tool_input": { "command": "safe_command" } },
+  "additionalContext": "context injected for the agent"
+}
+```
+
+Hook **stderr** is passed directly to the terminal — use it for logging.
+
+### Examples
+
+#### 1. Log all tool calls to terminal
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo \"[HOOK] $(cat | python3 -c \"import sys,json; d=json.load(sys.stdin); print(d['tool_name'], d.get('tool_input',{}).get('command','')[:50])\")\" >&2"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+#### 2. Block dangerous bash commands
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "CMD=$(cat | python3 -c \"import sys,json; print(json.load(sys.stdin).get('tool_input',{}).get('command',''))\"); if echo \"$CMD\" | grep -qE '(rm -rf /|mkfs|dd if=|:(){ :|:)'; then echo '{\"decision\": \"block\", \"reason\": \"Dangerous command blocked\"}'; fi"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+#### 3. Session start/end notifications
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo 'awesome-code session started' >&2"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo 'awesome-code session ended' >&2"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+#### 4. Auto-format after file write
+
+```json
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "write_file",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "FILE=$(cat | python3 -c \"import sys,json; print(json.load(sys.stdin).get('tool_input',{}).get('path',''))\"); if echo \"$FILE\" | grep -qE '\\.py$'; then python3 -m black \"$FILE\" 2>&1 >&2; fi"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+#### 5. Block specific sub-agent from spawning
+
+```json
+{
+  "hooks": {
+    "SubagentSpawn": [
+      {
+        "matcher": "test",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo '{\"decision\": \"block\", \"reason\": \"Test agent is disabled\"}'"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+#### 6. Auto-append context to every prompt
+
+```json
+{
+  "hooks": {
+    "PrePromptSubmit": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo '{\"decision\": \"modify\", \"updatedInput\": {\"prompt\": \"'\"$(cat | python3 -c \"import sys,json; print(json.load(sys.stdin)['prompt'])\" )\"'\\n\\nAlways write tests for new code.\"}}'"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+### /hooks Command
+
+Use `/hooks` in the REPL to see all configured hooks:
+
+```
+❯ /hooks
+
+  Hooks
+
+    PreToolUse          bash             ./block-dangerous.sh
+    PostToolUse         write_file       ./auto-format.py
+    SessionStart        *                echo 'started' >&2
+```
 
 ### Architecture
 
 ```
-┌──────────────┐     /init      ┌──────────────────┐
-│   cli.py     │ ──────────────▶│   agent.run()    │
-│   REPL loop  │                │   with INIT_PROMPT│
-└──────────────┘                └────────┬─────────┘
-                                         │ uses tools
-                                         ▼
-                                ┌──────────────────┐
-                                │ list_dir, read,  │
-                                │ bash, write_file │
-                                └────────┬─────────┘
-                                         │ writes
-                                         ▼
-                                .awesome-code/memory.md
-
-Next session:
-┌──────────────┐  builds prompt  ┌──────────────────┐
-│   llm.py     │ ◀──────────────│   memory.py      │
-│   system     │   load_memory() │   load/check     │
-│   prompt     │                 └──────────────────┘
-└──────────────┘
+┌──────────────┐          ┌──────────────┐
+│   cli.py     │─────────▶│   hooks.py   │
+│   agent.py   │  events  │              │
+│   agent_mgr  │◀─────────│  run_hooks() │
+└──────────────┘ decision  └──────┬───────┘
+                                  │ shell exec
+                                  ▼
+                           ┌──────────────┐
+                           │  user script │
+                           │  (stdin JSON)│
+                           │  (stdout JSON│
+                           │   + exit code│
+                           └──────────────┘
 ```
 
-**Key modules:**
-
-| File | Purpose |
-|------|---------|
-| `memory.py` | Load memory bank, check if initialized |
-| `llm.py` | Inject memory into system prompt via `_build_memory_section()` |
-| `cli.py` | `/init` command handler, welcome screen status |
-
-### Why This Design?
-
-- **Agent does the analysis** — the LLM understands code better than any hardcoded heuristic. It reads what matters and summarizes intelligently.
-- **No new tools needed** — reuses existing `list_dir`, `read_file`, `bash`, `write_file`.
-- **Simple persistence** — a single markdown file, human-readable, version-controllable.
-- **Lazy loading** — memory is only read when building the system prompt, not at startup.
+| File | Role |
+|------|------|
+| `hooks.py` | Hook engine: config loading, matching, execution, protocol |
+| `agent.py` | Integration: PreToolUse/PostToolUse/PostResponse via `_execute_tool_with_hooks()` |
+| `cli.py` | Integration: SessionStart/End, PrePromptSubmit, `/hooks` command |
+| `agent_manager.py` | Integration: SubagentSpawn/SubagentComplete |
 
 ---
 
@@ -162,6 +331,7 @@ awesome-code --setup  # Configure API key and model
 | `/index` | Index codebase for semantic search |
 | `/skills` | List available skills |
 | `/agents` | List available sub-agents |
+| `/hooks` | Show configured hooks |
 | `/switch` | Switch context between main and sub-agents |
 | `/skill-name` | Run a skill (e.g. `/review @file.py`) |
 | `/clear` | Clear conversation history |
@@ -198,7 +368,8 @@ Attach files to your message with `@path`:
   "ollama_url": "http://localhost:11434",
   "embed_model": "nomic-embed-text",
   "auto_index": false,
-  "mcpServers": {}
+  "mcpServers": {},
+  "hooks": {}
 }
 ```
 
@@ -211,6 +382,7 @@ awesome-code/
 │   ├── agent.py            # Agent loop — run, run_background, run_in_context
 │   ├── llm.py              # AsyncOpenAI client, async streaming
 │   ├── config.py           # Configuration management
+│   ├── hooks.py            # Hook system — lifecycle event handlers
 │   ├── memory.py           # Memory bank — persistent project context
 │   ├── setup.py            # Interactive setup wizard
 │   ├── skills.py           # Skill discovery and loading

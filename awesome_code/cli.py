@@ -11,7 +11,7 @@ from prompt_toolkit.document import Document
 from prompt_toolkit.formatted_text import HTML
 from prompt_toolkit.key_binding import KeyBindings
 
-from awesome_code import agent, agent_manager, agents, config, skills
+from awesome_code import agent, agent_manager, agents, config, hooks, skills
 from awesome_code.mcp import McpManager
 from awesome_code.setup import run_setup
 
@@ -28,6 +28,7 @@ COMMANDS = {
     "/index": "Index codebase for semantic search (requires Ollama)",
     "/skills": "List available skills",
     "/agents": "List available sub-agents",
+    "/hooks": "Show configured hooks",
     "/switch": "Switch context to a sub-agent (or back to main)",
 }
 
@@ -293,6 +294,15 @@ def print_welcome(mcp_manager: McpManager | None = None):
         f"{f'{mcp_count} server(s)' if mcp_count else 'none'}"
     )
 
+    # Hooks status
+    hook_items = hooks.list_configured_hooks()
+    hook_icon = "⊙" if hook_items else "○"
+    hook_style = "green" if hook_items else "#808080"
+    console.print(
+        f"  [#808080]hooks[/#808080]   [{hook_style}]{hook_icon}[/{hook_style}] "
+        f"{f'{len(hook_items)} configured' if hook_items else 'none'}"
+    )
+
     # Skills status
     skill_list = skills.discover_skills()
     if skill_list:
@@ -473,12 +483,22 @@ async def async_main():
 
         print_welcome(mcp_manager)
 
+        # Initialize hooks session
+        hooks.init_session()
+        session_result = await hooks.on_session_start()
+        if session_result.decision == hooks.HookDecision.BLOCK:
+            console.print(f"  [red]Session blocked by hook: {session_result.reason}[/red]")
+            return
+
         messages: list[dict] = []
+        if session_result.additional_context:
+            messages.append({"role": "system", "content": session_result.additional_context})
         current_context = "main"
 
         while True:
             user_input = await asyncio.to_thread(get_input, current_context)
             if user_input is None:
+                await hooks.on_session_end()
                 console.print("\n  [dim]Bye![/dim]")
                 break
 
@@ -486,6 +506,7 @@ async def async_main():
                 continue
 
             if user_input == "/quit":
+                await hooks.on_session_end()
                 console.print("  [dim]Bye![/dim]")
                 break
 
@@ -620,6 +641,26 @@ async def async_main():
                         _show_agent_header(entry, target)
                 continue
 
+            if user_input == "/hooks":
+                items = hooks.list_configured_hooks()
+                if not items:
+                    console.print("  [dim]No hooks configured.[/dim]")
+                    console.print(
+                        '  [dim]Add "hooks" to ~/.awesome-code/config.json[/dim]'
+                    )
+                else:
+                    console.print()
+                    console.print("  [bold #fab283]Hooks[/bold #fab283]")
+                    console.print()
+                    for event_name, matcher, commands in items:
+                        console.print(
+                            f"    [bold]{event_name:20s}[/bold] "
+                            f"[cyan]{matcher:16s}[/cyan] "
+                            f"[dim]{', '.join(commands)}[/dim]"
+                        )
+                    console.print()
+                continue
+
             if user_input == "/help":
                 console.print()
                 console.print("  [bold #fab283]Commands[/bold #fab283]")
@@ -659,6 +700,15 @@ async def async_main():
 
             try:
                 expanded = expand_file_refs(user_input)
+
+                # Pre-prompt hook
+                prompt_hook = await hooks.on_pre_prompt_submit(expanded)
+                if prompt_hook.decision == hooks.HookDecision.BLOCK:
+                    console.print(f"  [dim]Prompt blocked by hook: {prompt_hook.reason}[/dim]")
+                    continue
+                if prompt_hook.decision == hooks.HookDecision.MODIFY and prompt_hook.updated_input:
+                    expanded = prompt_hook.updated_input.get("prompt", expanded)
+
                 if current_context == "main":
                     await agent.run(expanded, messages)
                 else:

@@ -41,7 +41,7 @@ class SpawnAgentTool(BaseTool):
             )
 
         try:
-            task_id = agent_manager.spawn(agent_name, task, agent_md)
+            task_id = await agent_manager.spawn(agent_name, task, agent_md)
         except RuntimeError as e:
             return f"Error: {e}"
 

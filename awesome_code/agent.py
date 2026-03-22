@@ -4,6 +4,8 @@ from rich.console import Console
 from rich.markdown import Markdown
 from rich.text import Text
 
+from awesome_code import hooks
+from awesome_code.hooks import HookDecision
 from awesome_code.llm import get_client, stream_response
 from awesome_code.tools import TOOLS_BY_NAME
 
@@ -47,6 +49,47 @@ def _format_tool_result(result: str) -> str:
     return f"    [dim]{preview}[/dim]"
 
 
+async def _execute_tool_with_hooks(
+    fn_name: str,
+    fn_args: dict,
+    tool_lookup: dict,
+    show_output: bool = True,
+    prefix: str = "",
+) -> str:
+    """Execute a single tool call with pre/post hooks."""
+    # Pre-tool hook
+    pre = await hooks.on_pre_tool_use(fn_name, fn_args)
+    if pre.decision == HookDecision.BLOCK:
+        reason = pre.reason or "blocked by hook"
+        if show_output:
+            console.print(f"{prefix}  [yellow]⊘ {fn_name} blocked: {reason}[/yellow]")
+        return f"Tool '{fn_name}' blocked by hook: {reason}"
+
+    if pre.decision == HookDecision.MODIFY and pre.updated_input:
+        fn_args = pre.updated_input.get("tool_input", fn_args)
+
+    tool = tool_lookup.get(fn_name)
+    if not tool:
+        return f"Error: Unknown tool '{fn_name}'"
+
+    if show_output:
+        console.print(f"{prefix}{_format_tool_call(fn_name, fn_args)}")
+
+    result = await tool.execute_async(**fn_args)
+
+    if show_output:
+        console.print(f"{prefix}{_format_tool_result(result)}")
+
+    # Post-tool hook
+    post = await hooks.on_post_tool_use(fn_name, fn_args, result)
+    if post.decision == HookDecision.MODIFY and post.updated_input:
+        result = post.updated_input.get("tool_output", result)
+    if post.additional_context:
+        result += f"\n[Hook context: {post.additional_context}]"
+
+    return result
+
+
 async def run(user_message: str, messages: list[dict]):
     """Run the agent loop: send message, handle tool calls, repeat until done."""
     client = get_client()
@@ -66,6 +109,9 @@ async def run(user_message: str, messages: list[dict]):
         console.print()
         messages.append(assistant_msg)
 
+        if assistant_msg.get("content"):
+            await hooks.on_post_response(assistant_msg["content"])
+
         tool_calls = assistant_msg.get("tool_calls")
         if not tool_calls:
             break
@@ -79,13 +125,9 @@ async def run(user_message: str, messages: list[dict]):
             except json.JSONDecodeError:
                 fn_args = {}
 
-            tool = TOOLS_BY_NAME.get(fn_name)
-            if not tool:
-                result = f"Error: Unknown tool '{fn_name}'"
-            else:
-                console.print(_format_tool_call(fn_name, fn_args))
-                result = await tool.execute_async(**fn_args)
-                console.print(_format_tool_result(result))
+            result = await _execute_tool_with_hooks(
+                fn_name, fn_args, TOOLS_BY_NAME
+            )
 
             messages.append({
                 "role": "tool",
@@ -133,15 +175,11 @@ async def run_background(
             except json.JSONDecodeError:
                 fn_args = {}
 
-            tool = tool_lookup.get(fn_name)
-            if not tool:
-                result = f"Error: Unknown tool '{fn_name}'"
-            else:
-                if agent_label:
-                    console.print(f"{prefix} {_format_tool_call(fn_name, fn_args)}")
-                result = await tool.execute_async(**fn_args)
-                if agent_label:
-                    console.print(f"{prefix} {_format_tool_result(result)}")
+            result = await _execute_tool_with_hooks(
+                fn_name, fn_args, tool_lookup,
+                show_output=bool(agent_label),
+                prefix=f"{prefix} " if agent_label else "",
+            )
 
             messages.append({
                 "role": "tool",
@@ -191,13 +229,9 @@ async def run_in_context(
             except json.JSONDecodeError:
                 fn_args = {}
 
-            tool = tool_lookup.get(fn_name)
-            if not tool:
-                result = f"Error: Unknown tool '{fn_name}'"
-            else:
-                console.print(_format_tool_call(fn_name, fn_args))
-                result = await tool.execute_async(**fn_args)
-                console.print(_format_tool_result(result))
+            result = await _execute_tool_with_hooks(
+                fn_name, fn_args, tool_lookup
+            )
 
             messages.append({
                 "role": "tool",
