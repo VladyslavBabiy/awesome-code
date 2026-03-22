@@ -21,6 +21,7 @@ COMMANDS = {
     "/help": "Show available commands",
     "/quit": "Exit AwesomeCode",
     "/clear": "Clear conversation history",
+    "/init": "Initialize memory bank (analyze project for persistent context)",
     "/model": "Change the AI model",
     "/setup": "Reconfigure API key & model",
     "/mcp": "Show connected MCP servers & tools",
@@ -29,6 +30,46 @@ COMMANDS = {
     "/agents": "List available sub-agents",
     "/switch": "Switch context to a sub-agent (or back to main)",
 }
+
+INIT_PROMPT = """\
+Analyze this project and create a memory bank file. This file will be loaded \
+into your system prompt in future sessions to give you persistent project context.
+
+Steps:
+1. Use list_dir to understand the project structure (depth 3)
+2. Read key config files — look for: package.json, pyproject.toml, pom.xml, \
+Cargo.toml, go.mod, build.gradle, Makefile, Dockerfile, docker-compose.yml, \
+or similar project configuration files
+3. Read README.md if it exists (just skim for purpose and setup)
+4. Run `git remote -v` and `git log --oneline -5` to understand the repo context
+5. Write the result to .awesome-code/memory.md using write_file
+
+The memory file MUST follow this exact structure:
+
+# Project: {name}
+
+## Overview
+1-3 sentences: what this project does, who it's for.
+
+## Tech Stack
+- Language, framework, key libraries with versions
+
+## Architecture
+- Entry points, main modules, how they connect
+- Patterns used (MVC, event-driven, microservices, etc.)
+
+## Key Files
+- List the most important files with one-line descriptions
+
+## Conventions
+- Coding style, naming patterns, testing approach, anything notable
+
+Rules:
+- Keep it concise — this is context for an AI assistant, not documentation
+- Focus on what helps understand and modify the code quickly
+- Do NOT include file contents, just descriptions
+- Total length should be under 150 lines
+"""
 
 FILE_REF_PATTERN = re.compile(r"@(\S+)")
 
@@ -219,6 +260,12 @@ def print_welcome(mcp_manager: McpManager | None = None):
         idx_icon, idx_style = "○", "#808080"
         index_status = "not indexed"
 
+    # Memory bank status
+    from awesome_code.memory import memory_exists
+    mem_exists = memory_exists()
+    mem_icon = "⊙" if mem_exists else "○"
+    mem_style = "green" if mem_exists else "#808080"
+
     # MCP status
     mcp_count = 0
     if mcp_manager and mcp_manager.has_servers():
@@ -228,7 +275,7 @@ def print_welcome(mcp_manager: McpManager | None = None):
 
     console.print()
     console.print(f"[bold #fab283]{LOGO}[/bold #fab283]")
-    console.print(f"  [dim]v0.4.0[/dim]")
+    console.print(f"  [dim]v0.5.0[/dim]")
     console.print()
     _sep()
     console.print()
@@ -236,6 +283,10 @@ def print_welcome(mcp_manager: McpManager | None = None):
     console.print(f"  [#808080]dir[/#808080]     {os.path.basename(cwd)}/")
     console.print(
         f"  [#808080]index[/#808080]   [{idx_style}]{idx_icon}[/{idx_style}] {index_status}"
+    )
+    console.print(
+        f"  [#808080]memory[/#808080]  [{mem_style}]{mem_icon}[/{mem_style}] "
+        f"{'initialized' if mem_exists else 'not initialized (run /init)'}"
     )
     console.print(
         f"  [#808080]mcp[/#808080]     [{mcp_style}]{mcp_icon}[/{mcp_style}] "
@@ -454,6 +505,20 @@ async def async_main():
 
             if user_input == "/mcp":
                 handle_mcp_command(mcp_manager)
+                continue
+
+            if user_input == "/init":
+                from awesome_code.memory import memory_exists
+                if memory_exists():
+                    console.print("  [dim]Memory bank exists. Re-analyzing...[/dim]")
+                else:
+                    console.print("  [dim]Analyzing project...[/dim]")
+                try:
+                    await agent.run(INIT_PROMPT, messages)
+                except KeyboardInterrupt:
+                    console.print("\n  [dim]Interrupted.[/dim]")
+                except Exception as e:
+                    console.print(f"  [red]Error: {e}[/red]")
                 continue
 
             if user_input == "/index":
