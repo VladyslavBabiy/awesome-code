@@ -11,7 +11,7 @@ from prompt_toolkit.document import Document
 from prompt_toolkit.formatted_text import HTML
 from prompt_toolkit.key_binding import KeyBindings
 
-from awesome_code import agent, config
+from awesome_code import agent, config, skills
 from awesome_code.mcp import McpManager
 from awesome_code.setup import run_setup
 
@@ -25,6 +25,7 @@ COMMANDS = {
     "/setup": "Reconfigure API key & model",
     "/mcp": "Show connected MCP servers & tools",
     "/index": "Index codebase for semantic search (requires Ollama)",
+    "/skills": "List available skills",
 }
 
 FILE_REF_PATTERN = re.compile(r"@(\S+)")
@@ -57,6 +58,12 @@ class InputCompleter(Completer):
                 if cmd.startswith(text):
                     yield Completion(cmd, start_position=-len(text),
                                      display_meta=desc)
+            # Also suggest skills
+            for name in skills.discover_skills():
+                skill_cmd = f"/{name}"
+                if skill_cmd.startswith(text) and skill_cmd not in COMMANDS:
+                    yield Completion(skill_cmd, start_position=-len(text),
+                                     display_meta="skill")
             return
 
         at_pos = text.rfind("@")
@@ -222,6 +229,12 @@ def print_welcome(mcp_manager: McpManager | None = None):
         f"  [#808080]mcp[/#808080]     [{mcp_style}]{mcp_icon}[/{mcp_style}] "
         f"{f'{mcp_count} server(s)' if mcp_count else 'none'}"
     )
+
+    # Skills status
+    skill_list = skills.discover_skills()
+    if skill_list:
+        console.print(f"  [#808080]skills[/#808080]  [green]⊙[/green] {len(skill_list)} loaded")
+
     console.print()
     console.print(
         "  [#808080]"
@@ -346,6 +359,26 @@ async def async_main():
                 console.print(f"  [green]Model → {model}[/green]\n")
                 continue
 
+            if user_input == "/skills":
+                skill_items = skills.list_skills()
+                if not skill_items:
+                    console.print("  [dim]No skills found.[/dim]")
+                    console.print(
+                        "  [dim]Create ~/.awesome-code/skills/name.md "
+                        "or .awesome-code/skills/name.md[/dim]"
+                    )
+                else:
+                    console.print()
+                    console.print("  [bold #fab283]Skills[/bold #fab283]")
+                    console.print()
+                    for name, source, desc in skill_items:
+                        badge = "[dim](project)[/dim]" if source == "project" else "[dim](global)[/dim]"
+                        console.print(f"    [bold]/{name:16s}[/bold] {desc}  {badge}")
+                    console.print()
+                    console.print("  [dim]Usage: /skill-name your message here[/dim]")
+                    console.print()
+                continue
+
             if user_input == "/help":
                 console.print()
                 console.print("  [bold #fab283]Commands[/bold #fab283]")
@@ -356,12 +389,30 @@ async def async_main():
                 console.print("  [bold #fab283]Input[/bold #fab283]")
                 console.print()
                 console.print("    [bold]@file[/bold]           [dim]Attach file contents[/dim]")
+                console.print("    [bold]/skill-name[/bold]     [dim]Run a skill (/skills to list)[/dim]")
                 console.print("    [bold]Esc+Enter[/bold]       [dim]New line[/dim]")
                 console.print("    [bold]Enter[/bold]           [dim]Send message[/dim]")
                 console.print()
                 continue
 
+            # Try to match a skill: /name rest of message
             if user_input.startswith("/"):
+                parts = user_input[1:].split(None, 1)
+                skill_name = parts[0] if parts else ""
+                skill_content = skills.load_skill(skill_name)
+                if skill_content:
+                    user_msg = parts[1] if len(parts) > 1 else ""
+                    expanded = expand_file_refs(user_msg) if user_msg else ""
+                    full_msg = skill_content + "\n\n" + expanded if expanded else skill_content
+                    console.print(f"  [dim]Using skill: {skill_name}[/dim]")
+                    try:
+                        await agent.run(full_msg, messages)
+                    except KeyboardInterrupt:
+                        console.print("\n  [dim]Interrupted.[/dim]")
+                    except Exception as e:
+                        console.print(f"  [red]Error: {e}[/red]")
+                    continue
+
                 console.print(f"  [red]Unknown: {user_input}[/red] [dim]type /help[/dim]")
                 continue
 

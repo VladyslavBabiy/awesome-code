@@ -19,7 +19,27 @@ Guidelines:
 - Use index_codebase if the user asks to index or if search_codebase returns no index
 - If a task requires multiple steps, execute them one by one
 - Be concise and direct
-"""
+{skills_section}"""
+
+
+def _build_skills_section() -> str:
+    from awesome_code.skills import list_skills
+
+    items = list_skills()
+    if not items:
+        return ""
+
+    lines = [
+        "\nAvailable skills (use load_skill tool to load instructions before executing the task):",
+    ]
+    for name, source, description in items:
+        lines.append(f"  - {name}: {description}")
+    lines.append(
+        "\nWhen the user's request matches a skill, load it with load_skill "
+        "and follow its instructions. Apply the skill automatically — "
+        "don't ask the user whether to use it."
+    )
+    return "\n".join(lines)
 
 
 def get_client() -> OpenAI:
@@ -44,10 +64,15 @@ def stream_response(client: OpenAI, messages: list[dict], on_text=None):
     model = get_model()
     tools = get_tools_for_api()
 
+    system_content = SYSTEM_PROMPT.format(
+        cwd=os.getcwd(),
+        skills_section=_build_skills_section(),
+    )
+
     stream = client.chat.completions.create(
         model=model,
         messages=[
-            {"role": "system", "content": SYSTEM_PROMPT.format(cwd=os.getcwd())},
+            {"role": "system", "content": system_content},
             *messages,
         ],
         tools=tools,
