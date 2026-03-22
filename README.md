@@ -12,287 +12,352 @@ A CLI tool that lets you pair-program with LLMs right from your terminal — ask
 - **Semantic Code Search** — index your codebase with Ollama embeddings, search by meaning
 - **MCP Support** — connect external MCP servers for additional tools
 - **Skills** — reusable prompt templates loaded from markdown files
+- **Sub-Agents** — spawn specialized agents that work asynchronously with clean context
 - **Multi-Model** — works with Claude, GPT-4, Gemini, DeepSeek, Llama and more via OpenRouter
 
 ---
 
-## Lesson: Skills & Prompt Engineering
+## Lesson 5: Sub-Agents
 
-### Why Skills?
+### The Problem
 
-Every coding agent — Claude Code, Cursor, Windsurf — has the same challenge: the LLM needs **context** to do its job well. Without instructions, the LLM guesses what you want. With good instructions, it delivers exactly what you need.
+A single LLM agent tries to do everything in one conversation: review code, write tests, check security, optimize performance. This creates two problems:
 
-But writing good instructions every time is tedious:
+1. **Context pollution** — the conversation fills up with intermediate tool results (file contents, command output). By the time the agent gets to the third task, it has 50 messages of context from the first two, and its quality drops.
+
+2. **Sequential execution** — the agent works on one thing at a time. If you ask it to review 3 files, it reviews them one after another. You wait for all three.
+
+This is exactly how humans work too — if you ask one person to do five different jobs, they context-switch, get tired, and the quality of the last job suffers. The solution? **Delegate to specialists.**
+
+### What are Sub-Agents?
+
+A sub-agent is a **separate LLM instance** that:
+
+- Has its own **clean conversation context** (empty message history)
+- Uses a **specialized system prompt** from a markdown file
+- Has access to all the same **tools** (read_file, write_file, bash, etc.)
+- Runs **asynchronously** — the main agent and user don't wait for it
+- **Cannot spawn other sub-agents** (no recursion)
+
+Think of it like this:
 
 ```
-❯ Review this code. Check for bugs, security issues like SQL injection
-  and XSS, performance problems like N+1 queries, and readability.
-  For each issue quote the line, explain the problem, and suggest a fix.
-  Don't invent problems that don't exist...
+Main Agent (general purpose)
+  ├── spawns → code-reviewer   (clean context, review prompt)
+  ├── spawns → test-automator  (clean context, testing prompt)
+  └── spawns → security-engineer (clean context, security prompt)
+
+Each sub-agent works independently, in parallel.
+The user sees live progress and switches between them with /switch.
 ```
 
-You end up copying the same paragraph across conversations. Skills solve this by saving instructions as files.
+### Why Clean Context Matters
 
-### What are Skills?
-
-A skill is a **markdown file** containing instructions for the LLM. When you type `/skill-name`, awesome-code reads the file and prepends its content to your message.
+When the main agent has been working for a while, its context looks like this:
 
 ```
-~/.awesome-code/skills/review.md    →  invoke with /review
-~/.awesome-code/skills/explain.md   →  invoke with /explain
-.awesome-code/skills/deploy.md      →  invoke with /deploy (project-only)
+messages = [
+  user: "explain the project structure"
+  assistant: (text + tool calls)
+  tool: (list_dir results — 200 lines)
+  tool: (read_file results — 300 lines)
+  assistant: (explanation)
+  user: "now review agent.py"        ← by this point, 500+ lines of context
+  assistant: (text + tool calls)
+  tool: (read_file — 150 lines)
+  ...
+]
 ```
 
-The mapping is simple: **filename = command name**.
+The review quality degrades because the LLM is processing all that irrelevant context from the previous task.
+
+A sub-agent starts fresh:
+
+```
+messages = [
+  user: "Review agent.py for bugs, security, performance..."
+]
+```
+
+It gets the full system prompt with review instructions, reads the file it needs, and focuses entirely on the review. No noise.
 
 ### How It Works
 
-```
-User types: /review @awesome_code/agent.py focus on error handling
+#### 1. Define Agents
 
-┌─────────────────────────────────────────────────────────────┐
-│                                                             │
-│  1. PARSE                                                   │
-│     skill_name = "review"                                   │
-│     user_input = "@awesome_code/agent.py focus on ..."      │
-│                                                             │
-│  2. LOAD SKILL                                              │
-│     Read ~/.awesome-code/skills/review.md                   │
-│     ┌─────────────────────────────────────────────────┐     │
-│     │ You are performing a code review.                │     │
-│     │ Analyze the provided code for:                   │     │
-│     │ 1. Bugs: logic errors, null handling             │     │
-│     │ 2. Security: injection, XSS, credentials        │     │
-│     │ 3. Performance: N+1, unnecessary allocations     │     │
-│     │ 4. Readability: naming, complexity, dead code    │     │
-│     │                                                  │     │
-│     │ For each issue: quote the line, explain, fix.    │     │
-│     └─────────────────────────────────────────────────┘     │
-│                                                             │
-│  3. EXPAND @FILE                                            │
-│     Read awesome_code/agent.py → file contents              │
-│                                                             │
-│  4. COMBINE & SEND                                          │
-│     ┌─────────────────────────────────────────────────┐     │
-│     │ [skill instructions]                             │     │
-│     │                                                  │     │
-│     │ focus on error handling                          │     │
-│     │                                                  │     │
-│     │ <attached_file path="awesome_code/agent.py">     │     │
-│     │ import json                                      │     │
-│     │ from rich.console import Console                 │     │
-│     │ ...                                              │     │
-│     │ </attached_file>                                 │     │
-│     └─────────────────────────────────────────────────┘     │
-│                                        ↓                    │
-│  5. LLM receives everything as one message                  │
-│     → responds with a structured code review                │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### Skill Resolution
-
-Skills are discovered from two directories:
+Agents are markdown files in the `agents/` directory. The filename is the agent name:
 
 ```
-~/.awesome-code/skills/     ← global (available in any project)
-.awesome-code/skills/       ← project-local (overrides global)
+~/.awesome-code/agents/          ← global (available in any project)
+    code-reviewer.md
+    test-automator.md
+    security-engineer.md
+.awesome-code/agents/            ← project-local (overrides global)
+    deploy-checker.md
 ```
 
-| Scenario | What happens |
-|----------|-------------|
-| Only global `review.md` exists | `/review` uses global |
-| Only project `review.md` exists | `/review` uses project |
-| Both exist | `/review` uses **project** (local overrides global) |
-| Neither exists | `/review` → "Unknown command" |
-
-This lets you customize skills per-project. A Python project might have a `/review` that checks for type hints, while a Go project checks for error handling.
-
-### Prompt Engineering: Writing Good Skills
-
-A skill is just text — but **how** you write it determines how useful the LLM's response will be. Here are the principles:
-
-#### 1. Set the Role
-
-Tell the LLM **who** it is for this task:
+An agent file is a system prompt — it tells the LLM who it is and how to behave:
 
 ```markdown
-You are a senior security engineer reviewing code for vulnerabilities.
+# Code Reviewer
+
+You are a senior code reviewer. Analyze the provided code for:
+
+1. **Bugs**: logic errors, null handling, race conditions
+2. **Security**: injection, XSS, credential exposure
+3. **Performance**: N+1 queries, unnecessary allocations
+4. **Readability**: naming, complexity, dead code
+
+For each issue: quote the line, explain the problem, provide a fix.
+If the code is solid, say so. Don't invent issues.
 ```
 
-vs. the generic "Review this code" — the role focuses the LLM's expertise.
+#### 2. Spawning
 
-#### 2. Be Specific About What to Check
+The main agent has a `spawn_agent` tool. When the user asks to review code, the main agent calls:
 
-Don't say "check for issues". List exactly what to look for:
-
-```markdown
-Check for:
-1. SQL injection via string concatenation in queries
-2. XSS through unescaped user input in templates
-3. Hardcoded credentials or API keys
-4. Path traversal in file operations
-5. Missing input validation at API boundaries
+```
+spawn_agent(agent_name="code-reviewer", task="Review agent.py for ...")
 ```
 
-#### 3. Define the Output Format
+What happens internally:
 
-Tell the LLM how to structure its response:
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  spawn_agent("code-reviewer", "Review agent.py ...")            │
+│                                                                 │
+│  1. LOAD AGENT                                                  │
+│     Read ~/.awesome-code/agents/code-reviewer.md                │
+│     → system prompt for the sub-agent                           │
+│                                                                 │
+│  2. BUILD TOOL SET                                              │
+│     All tools EXCEPT spawn_agent (no recursion)                 │
+│     [read_file, write_file, bash, list_dir, ...]               │
+│                                                                 │
+│  3. CREATE CLEAN CONTEXT                                        │
+│     messages = []  ← empty, fresh start                         │
+│     system_prompt = agent.md content + cwd + guidelines         │
+│                                                                 │
+│  4. LAUNCH ASYNC TASK                                           │
+│     asyncio.create_task(run_background(...))                    │
+│     → sub-agent runs concurrently with the main agent           │
+│                                                                 │
+│  5. RETURN IMMEDIATELY                                          │
+│     Main agent tells user: "spawned, use /switch to see results"│
+└─────────────────────────────────────────────────────────────────┘
+```
+
+#### 3. Async Execution
+
+The sub-agent runs as an `asyncio.Task` on the same event loop. The key that makes this work: **async streaming**.
+
+```python
+# llm.py uses AsyncOpenAI — yields control between chunks
+stream = await client.chat.completions.create(stream=True, ...)
+async for chunk in stream:   # ← yields to event loop between chunks
+    ...
+```
+
+With sync `OpenAI`, `for chunk in stream:` blocks the entire event loop. Nothing else can run. With `AsyncOpenAI`, the `async for` yields control between chunks, allowing the main agent and all sub-agents to interleave execution.
+
+While the sub-agent works, the user sees live output with a prefix:
+
+```
+  [code-reviewer] → read_file  path='awesome_code/agent.py'
+  [code-reviewer]   import json from rich.console import Console...
+  [code-reviewer] ✓ done
+```
+
+#### 4. Switching Context
+
+The `/switch` command opens an interactive picker:
+
+```
+  Switch context
+
+  → main       primary agent
+    code-reviewer  ✓ completed  Review agent.py for bugs...
+    test-automator ⟳ running    Write tests for agent.py...
+
+  ↑↓ navigate  enter select  esc cancel
+```
+
+When you switch to a completed agent, you see:
+
+```
+  ─── code-reviewer ✓ ────────────────────────────────────
+  Task: Review agent.py for bugs, security, performance
+
+  [full review result rendered as markdown]
+
+[code-reviewer] ❯ _
+```
+
+You can now send follow-up messages to the sub-agent — it remembers its conversation context:
+
+```
+[code-reviewer] ❯ can you also check the error handling in run_background?
+```
+
+Type `/switch main` or `/switch` → select main to go back.
+
+### Architecture
+
+```
+┌────────────────────────────────────────────────┐
+│                   cli.py                        │
+│  REPL loop · /switch · status bar · context    │
+│                                                 │
+│  current_context = "main" | "code-reviewer"     │
+│                                                 │
+│  if main → agent.run(msg, messages)             │
+│  if sub  → agent.run_in_context(               │
+│              system_prompt, msg,                │
+│              entry.messages, entry.tools)       │
+└────────────┬───────────────────────┬────────────┘
+             │                       │
+     ┌───────▼───────┐      ┌───────▼────────┐
+     │   agent.py     │      │ agent_manager   │
+     │                │      │                 │
+     │ run()          │      │ spawn()         │
+     │ run_background │      │ get_by_name()   │
+     │ run_in_context │      │ format_status() │
+     └───────┬────────┘      └────────┬────────┘
+             │                        │
+     ┌───────▼────────────────────────▼──────────┐
+     │              llm.py                        │
+     │  AsyncOpenAI · async streaming             │
+     │  system prompt with agents section         │
+     └───────────────────────────────────────────┘
+```
+
+**Key modules:**
+
+| File | Purpose |
+|------|---------|
+| `agents.py` | Discovery — scan `~/.awesome-code/agents/` and `.awesome-code/agents/` for `.md` files |
+| `agent_manager.py` | Lifecycle — spawn async tasks, track status, deduplicate by name |
+| `agent.py: run_background()` | Execute sub-agent loop silently with prefixed live output |
+| `agent.py: run_in_context()` | Interactive mode — same as `run()` but with custom system prompt |
+| `tools/spawn_agent.py` | Tool exposed to the LLM — calls `agent_manager.spawn()` |
+
+### Skills vs Agents
+
+Both are markdown files with instructions for the LLM. The difference is **context**:
+
+| | Skills | Agents |
+|---|--------|--------|
+| **Context** | Shares the main conversation | Gets a clean, empty context |
+| **Execution** | Synchronous — main agent runs it inline | Asynchronous — runs in background |
+| **System prompt** | Added to the user message | Replaces the system prompt |
+| **Interaction** | One-shot, part of main flow | Persistent, switchable via `/switch` |
+| **Use case** | Quick task with current context | Independent task needing focus |
+
+**When to use skills:** "Review this file I'm already looking at" — the skill needs the current context.
+
+**When to use agents:** "Run a full security audit on the project" — the agent needs to independently explore and shouldn't pollute the main conversation.
+
+### Implementation Details
+
+#### Agent Discovery (`agents.py`)
+
+Follows the same pattern as skills — scan two directories, project overrides global:
+
+```python
+def discover_agents() -> dict[str, str]:
+    """Returns {name: file_path}. Project agents override global."""
+    agents = {}
+    agents.update(_scan("~/.awesome-code/agents/"))  # global
+    agents.update(_scan(".awesome-code/agents/"))     # project (overrides)
+    return agents
+```
+
+#### Concurrency Control (`agent_manager.py`)
+
+Maximum 3 concurrent sub-agents. Each spawned agent creates an `asyncio.Task` with a done-callback:
+
+```python
+MAX_CONCURRENT = 3
+
+def spawn(agent_name, task, agent_md) -> task_id:
+    # 1. Check limit
+    # 2. Build system prompt from agent.md
+    # 3. Build tool set (all tools minus spawn_agent)
+    # 4. Create asyncio.Task → run_background(...)
+    # 5. Register done-callback → update status + print notification
+    # 6. Return task_id
+```
+
+Sub-agents cannot spawn other sub-agents — `spawn_agent` is filtered out of their tool set.
+
+#### Status Bar
+
+Before each prompt, the CLI shows a compact status bar:
+
+```
+  agents: ⟳ code-reviewer  ✓ test-automator  ✗ security-engineer
+```
+
+Deduplicated by name — if the same agent is spawned twice, only the latest instance is shown.
+
+### Writing Good Agent Prompts
+
+Agent prompts follow the same principles as skill prompts, with one addition: **the agent needs to be self-sufficient**. It can't ask the user for clarification. It needs to know:
+
+1. **What to do** — clear objective
+2. **How to find what it needs** — which tools to use, what to look for
+3. **What format to report in** — structured output the user can act on
+4. **When to stop** — boundaries to prevent infinite exploration
+
+Example of a well-structured agent:
 
 ```markdown
-For each issue found:
-- **Location**: file:line
-- **Severity**: critical / high / medium / low
-- **Problem**: what's wrong and why it matters
+# Security Engineer
+
+You are a security engineer performing a security audit.
+
+## Process
+1. Use list_dir to understand the project structure
+2. Use read_file to examine entry points (API routes, CLI handlers)
+3. Search for common vulnerability patterns:
+   - SQL/NoSQL injection
+   - XSS (unescaped user input in templates)
+   - Path traversal (user input in file operations)
+   - Hardcoded secrets (API keys, passwords in code)
+   - Missing authentication/authorization checks
+   - Insecure deserialization
+
+## Output Format
+For each finding:
+- **Severity**: CRITICAL / HIGH / MEDIUM / LOW
+- **File**: path:line
+- **Issue**: what's wrong
+- **Impact**: what an attacker could do
 - **Fix**: concrete code change
 
-If no issues found, say "No issues found" — don't invent problems.
+End with a summary: total findings by severity, overall risk assessment.
+If the codebase is clean, say so — don't invent issues.
 ```
 
-#### 4. Set Boundaries
+---
 
-Prevent the LLM from going off-topic:
+## Previous Lessons
 
-```markdown
-Only analyze the provided code. Don't:
-- Suggest architectural changes
-- Add features not asked for
-- Rewrite working code for style preferences
-```
+### Lesson 4: Skills & Prompt Engineering
 
-#### 5. Provide Examples (Few-Shot)
+Skills are reusable prompt templates — markdown files that get prepended to your message when you type `/skill-name`. See the [skills section](#what-are-skills) for details.
 
-Show the LLM what good output looks like:
+### Lesson 3: Semantic Code Search (RAG)
 
-```markdown
-Example output:
+Index your codebase with Ollama embeddings and search by meaning, not just keywords.
 
-**SQL Injection** (critical)
-Location: db/queries.py:42
-```python
-query = f"SELECT * FROM users WHERE name = '{name}'"
-```
-Problem: User input is interpolated directly into SQL.
-Fix: Use parameterized queries:
-```python
-query = "SELECT * FROM users WHERE name = %s"
-cursor.execute(query, (name,))
-```
-```
+### Lesson 2: MCP (Model Context Protocol)
 
-### Example Skills
+Connect external tools via MCP servers — extend the agent with any capability.
 
-Here are complete, production-quality skills you can use:
+### Lesson 1: Agent Loop
 
-#### `review.md` — Code Review
-
-```markdown
-You are performing a thorough code review.
-
-Analyze the provided code for:
-
-1. **Bugs**: Logic errors, off-by-one, null/undefined access, race conditions
-2. **Security**: Injection, XSS, credential exposure, path traversal, missing auth
-3. **Performance**: N+1 queries, unnecessary allocations, missing caching, blocking I/O
-4. **Readability**: Poor naming, excessive complexity, dead code, missing error handling
-
-For each issue:
-- Quote the specific line(s)
-- Explain why it's a problem
-- Provide a concrete fix
-
-If the code is solid, say so briefly. Don't invent issues that don't exist.
-Prioritize critical bugs and security issues over style preferences.
-```
-
-#### `explain.md` — Code Explanation
-
-```markdown
-Explain the provided code clearly.
-
-Structure your explanation:
-1. **Summary**: One sentence — what does this code do?
-2. **Walk-through**: Step through the logic, explain each section
-3. **Key patterns**: Note any design patterns, idioms, or techniques used
-4. **Dependencies**: What does this code depend on? What depends on it?
-5. **Gotchas**: Any non-obvious behavior, edge cases, or potential pitfalls
-
-Assume the reader is a developer who hasn't seen this codebase before.
-Use simple language. Avoid jargon unless you explain it.
-```
-
-#### `test.md` — Test Generation
-
-```markdown
-Write comprehensive tests for the provided code.
-
-Requirements:
-- Detect and use the project's existing test framework (pytest, jest, go test, etc.)
-- Cover: happy path, edge cases, error conditions, boundary values
-- Use descriptive test names that explain what's being tested
-- Mock external dependencies (database, HTTP, file system)
-- Each test should be independent — no shared mutable state
-
-Structure:
-1. List what you're testing and why
-2. Write the tests
-3. Note any untestable code and suggest how to make it testable
-```
-
-#### `refactor.md` — Code Refactoring
-
-```markdown
-Refactor the provided code to improve readability and maintainability.
-
-Rules:
-- Keep the same external behavior (inputs/outputs unchanged)
-- Extract functions only if they're reused or reduce complexity
-- Improve variable/function names to be self-documenting
-- Remove dead code and unnecessary comments
-- Simplify conditionals and reduce nesting
-- Don't over-engineer — three similar lines is better than a premature abstraction
-
-Show the refactored code, then briefly explain what changed and why.
-```
-
-### Implementation
-
-**`skills.py`** — two functions:
-
-```python
-def discover_skills() -> dict[str, str]:
-    """Scan global + project dirs for .md files. Returns {name: path}."""
-    skills = {}
-
-    # Global: ~/.awesome-code/skills/*.md
-    for path in glob("~/.awesome-code/skills/*.md"):
-        skills[stem(path)] = path
-
-    # Project: .awesome-code/skills/*.md (overrides global)
-    for path in glob(".awesome-code/skills/*.md"):
-        skills[stem(path)] = path
-
-    return skills
-
-def load_skill(name: str) -> str | None:
-    """Read skill content. Returns None if not found."""
-    path = discover_skills().get(name)
-    return read(path) if path else None
-```
-
-**Invocation in CLI** — when `/` input doesn't match a built-in command:
-
-```python
-# /review @agent.py check error handling
-parts = input[1:].split(None, 1)     # ["review", "@agent.py check ..."]
-skill = load_skill(parts[0])          # read review.md
-if skill:
-    msg = skill + "\n\n" + expand_file_refs(parts[1])
-    await agent.run(msg, messages)     # send to LLM
-```
-
-**Autocomplete** — skills appear in `/` suggestions alongside built-in commands.
+The core: stream LLM responses, execute tool calls, repeat until done.
 
 ---
 
@@ -327,6 +392,8 @@ awesome-code --setup  # Configure API key and model
 | `/mcp` | Show connected MCP servers |
 | `/index` | Index codebase for semantic search |
 | `/skills` | List available skills |
+| `/agents` | List available sub-agents |
+| `/switch` | Switch context between main and sub-agents |
 | `/skill-name` | Run a skill (e.g. `/review @file.py`) |
 | `/clear` | Clear conversation history |
 | `/quit` | Exit |
@@ -371,12 +438,14 @@ Attach files to your message with `@path`:
 ```
 awesome-code/
 ├── awesome_code/
-│   ├── cli.py              # REPL loop and slash commands
-│   ├── agent.py            # Agent loop — tool execution and LLM
-│   ├── llm.py              # LLM client, streaming, system prompt
+│   ├── cli.py              # REPL loop, /switch, status bar
+│   ├── agent.py            # Agent loop — run, run_background, run_in_context
+│   ├── llm.py              # AsyncOpenAI client, async streaming
 │   ├── config.py           # Configuration management
 │   ├── setup.py            # Interactive setup wizard
 │   ├── skills.py           # Skill discovery and loading
+│   ├── agents.py           # Agent discovery and loading
+│   ├── agent_manager.py    # Sub-agent lifecycle and status tracking
 │   ├── indexing/
 │   │   ├── __init__.py     # Orchestrator
 │   │   ├── scanner.py      # File discovery and SHA-256
@@ -393,7 +462,9 @@ awesome-code/
 │       ├── bash.py
 │       ├── list_dir.py
 │       ├── index_codebase.py
-│       └── search_codebase.py
+│       ├── search_codebase.py
+│       ├── load_skill.py
+│       └── spawn_agent.py
 ├── pyproject.toml
 ├── install.sh
 └── README.md
@@ -402,9 +473,9 @@ awesome-code/
 ## Tech Stack
 
 - **Python 3.10+**
-- [openai](https://pypi.org/project/openai/) — OpenAI-compatible API client (works with OpenRouter)
+- [openai](https://pypi.org/project/openai/) — AsyncOpenAI client (works with OpenRouter)
 - [rich](https://pypi.org/project/rich/) — terminal UI and syntax highlighting
-- [prompt_toolkit](https://pypi.org/project/prompt_toolkit/) — input handling and autocomplete
+- [prompt_toolkit](https://pypi.org/project/prompt_toolkit/) — input handling, autocomplete, interactive picker
 - [mcp](https://pypi.org/project/mcp/) — Model Context Protocol SDK
 - [httpx](https://pypi.org/project/httpx/) — async HTTP client (for Ollama)
 - [numpy](https://pypi.org/project/numpy/) — vector math and cosine similarity

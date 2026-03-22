@@ -11,7 +11,7 @@ from prompt_toolkit.document import Document
 from prompt_toolkit.formatted_text import HTML
 from prompt_toolkit.key_binding import KeyBindings
 
-from awesome_code import agent, config, skills
+from awesome_code import agent, agent_manager, agents, config, skills
 from awesome_code.mcp import McpManager
 from awesome_code.setup import run_setup
 
@@ -26,6 +26,8 @@ COMMANDS = {
     "/mcp": "Show connected MCP servers & tools",
     "/index": "Index codebase for semantic search (requires Ollama)",
     "/skills": "List available skills",
+    "/agents": "List available sub-agents",
+    "/switch": "Switch context to a sub-agent (or back to main)",
 }
 
 FILE_REF_PATTERN = re.compile(r"@(\S+)")
@@ -158,11 +160,21 @@ _kb = _make_keybindings()
 # ── Input ──────────────────────────────────────────────────────
 
 
-def get_input() -> str | None:
+def get_input(context: str = "main") -> str | None:
     try:
+        # Show agent status bar if there are running agents
+        status_bar = agent_manager.format_status_bar()
+        if status_bar:
+            console.print(status_bar)
         _sep()
+
+        if context == "main":
+            prompt_text = HTML("<b fg='ansicyan'>❯ </b>")
+        else:
+            prompt_text = HTML(f"<b fg='ansimagenta'>[{context}]</b> <b fg='ansicyan'>❯ </b>")
+
         result = pt_prompt(
-            HTML("<b fg='ansicyan'>❯ </b>"),
+            prompt_text,
             placeholder=HTML(
                 "<style fg='#666666'>"
                 "Ask about your code, or type / for commands..."
@@ -216,7 +228,7 @@ def print_welcome(mcp_manager: McpManager | None = None):
 
     console.print()
     console.print(f"[bold #fab283]{LOGO}[/bold #fab283]")
-    console.print(f"  [dim]v0.3.0[/dim]")
+    console.print(f"  [dim]v0.4.0[/dim]")
     console.print()
     _sep()
     console.print()
@@ -234,6 +246,11 @@ def print_welcome(mcp_manager: McpManager | None = None):
     skill_list = skills.discover_skills()
     if skill_list:
         console.print(f"  [#808080]skills[/#808080]  [green]⊙[/green] {len(skill_list)} loaded")
+
+    # Agents status
+    agent_list = agents.discover_agents()
+    if agent_list:
+        console.print(f"  [#808080]agents[/#808080]  [green]⊙[/green] {len(agent_list)} loaded")
 
     console.print()
     console.print(
@@ -267,6 +284,114 @@ def handle_mcp_command(mcp_manager: McpManager):
     console.print()
 
 
+# ── Switch picker ─────────────────────────────────────────────
+
+
+def _show_agent_header(entry, target: str):
+    """Show agent header + result/status when switching context."""
+    style, icon = agent_manager.STATUS_ICONS[entry.status]
+    console.print()
+    console.print(
+        f"  ─── [magenta]{target}[/magenta] "
+        f"{style}{icon}[/] "
+        f"{'─' * max(1, console.width - len(target) - 10)}"
+    )
+    console.print(f"  [dim]Task: {entry.task}[/dim]")
+    console.print()
+    if entry.status == agent_manager.AgentStatus.COMPLETED and entry.result:
+        from rich.markdown import Markdown
+        console.print(Markdown(entry.result))
+        console.print()
+    elif entry.status == agent_manager.AgentStatus.FAILED:
+        console.print(f"  [red]Error: {entry.error}[/red]")
+        console.print()
+    elif entry.status == agent_manager.AgentStatus.RUNNING:
+        console.print("  [bright_yellow]⟳ Still working...[/bright_yellow]")
+        console.print()
+
+
+def _interactive_switch(current_context: str) -> str:
+    """Interactive arrow-key picker for /switch. Returns selected context name."""
+    from prompt_toolkit.application import Application
+    from prompt_toolkit.key_binding import KeyBindings as KB
+    from prompt_toolkit.layout.containers import HSplit, Window
+    from prompt_toolkit.layout.controls import FormattedTextControl
+    from prompt_toolkit.layout import Layout
+
+    # Build choices: main + deduplicated agents
+    all_tasks = agent_manager.list_all()
+    latest: dict[str, agent_manager.SubAgentTask] = {}
+    for t in all_tasks:
+        latest[t.name] = t
+
+    choices: list[tuple[str, str]] = [("main", "primary agent")]
+    for t in latest.values():
+        style, icon = agent_manager.STATUS_ICONS[t.status]
+        task_preview = t.task[:50] + ("..." if len(t.task) > 50 else "")
+        choices.append((t.name, f"{icon} {t.status.value}  {task_preview}"))
+
+    if len(choices) == 1:
+        console.print("  [dim]No sub-agents spawned yet.[/dim]")
+        return current_context
+
+    # Find initial cursor position
+    selected = [0]
+    for i, (name, _) in enumerate(choices):
+        if name == current_context:
+            selected[0] = i
+            break
+
+    result = [current_context]
+
+    def _get_text():
+        lines = []
+        lines.append(("bold", "  Switch context\n"))
+        lines.append(("", "\n"))
+        for i, (name, desc) in enumerate(choices):
+            if i == selected[0]:
+                lines.append(("bold fg:ansicyan", f"  → {name}"))
+                lines.append(("fg:#808080", f"  {desc}\n"))
+            else:
+                lines.append(("", f"    {name}"))
+                lines.append(("fg:#808080", f"  {desc}\n"))
+        lines.append(("", "\n"))
+        lines.append(("fg:#808080", "  ↑↓ navigate  enter select  esc cancel"))
+        return lines
+
+    kb = KB()
+
+    @kb.add("up")
+    def _up(event):
+        selected[0] = max(0, selected[0] - 1)
+
+    @kb.add("down")
+    def _down(event):
+        selected[0] = min(len(choices) - 1, selected[0] + 1)
+
+    @kb.add("enter")
+    def _enter(event):
+        result[0] = choices[selected[0]][0]
+        event.app.exit()
+
+    @kb.add("escape")
+    def _escape(event):
+        event.app.exit()
+
+    @kb.add("c-c")
+    def _ctrl_c(event):
+        event.app.exit()
+
+    control = FormattedTextControl(_get_text)
+    app = Application(
+        layout=Layout(HSplit([Window(content=control)])),
+        key_bindings=kb,
+        full_screen=False,
+    )
+    app.run()
+
+    return result[0]
+
+
 # ── Main loop ──────────────────────────────────────────────────
 
 
@@ -298,9 +423,10 @@ async def async_main():
         print_welcome(mcp_manager)
 
         messages: list[dict] = []
+        current_context = "main"
 
         while True:
-            user_input = await asyncio.to_thread(get_input)
+            user_input = await asyncio.to_thread(get_input, current_context)
             if user_input is None:
                 console.print("\n  [dim]Bye![/dim]")
                 break
@@ -313,7 +439,12 @@ async def async_main():
                 break
 
             if user_input == "/clear":
-                messages.clear()
+                if current_context == "main":
+                    messages.clear()
+                else:
+                    entry = agent_manager.get_by_name(current_context)
+                    if entry:
+                        entry.messages.clear()
                 console.print("  [dim]History cleared.[/dim]")
                 continue
 
@@ -379,6 +510,51 @@ async def async_main():
                     console.print()
                 continue
 
+            if user_input == "/agents":
+                agent_items = agents.list_agents()
+                if not agent_items:
+                    console.print("  [dim]No agents found.[/dim]")
+                    console.print(
+                        "  [dim]Create ~/.awesome-code/agents/name.md "
+                        "or .awesome-code/agents/name.md[/dim]"
+                    )
+                else:
+                    console.print()
+                    console.print("  [bold #fab283]Sub-Agents[/bold #fab283]")
+                    console.print()
+                    for name, source, desc in agent_items:
+                        badge = "[dim](project)[/dim]" if source == "project" else "[dim](global)[/dim]"
+                        console.print(f"    [bold]{name:16s}[/bold] {desc}  {badge}")
+                    console.print()
+                    console.print("  [dim]The AI will use spawn_agent tool to delegate tasks[/dim]")
+                    console.print()
+                continue
+
+            if user_input.startswith("/switch"):
+                parts = user_input.split(None, 1)
+                if len(parts) == 1:
+                    # Interactive picker
+                    target = await asyncio.to_thread(
+                        _interactive_switch, current_context
+                    )
+                else:
+                    target = parts[1].strip()
+
+                if target == current_context:
+                    pass  # no change
+                elif target == "main":
+                    current_context = "main"
+                    console.print("  [dim]Switched to [bold]main[/bold] context.[/dim]")
+                else:
+                    entry = agent_manager.get_by_name(target)
+                    if not entry:
+                        console.print(f"  [red]No sub-agent '{target}' found.[/red]")
+                        console.print("  [dim]Use /switch to see available contexts.[/dim]")
+                    else:
+                        current_context = target
+                        _show_agent_header(entry, target)
+                continue
+
             if user_input == "/help":
                 console.print()
                 console.print("  [bold #fab283]Commands[/bold #fab283]")
@@ -418,7 +594,19 @@ async def async_main():
 
             try:
                 expanded = expand_file_refs(user_input)
-                await agent.run(expanded, messages)
+                if current_context == "main":
+                    await agent.run(expanded, messages)
+                else:
+                    entry = agent_manager.get_by_name(current_context)
+                    if entry:
+                        await agent.run_in_context(
+                            entry.system_prompt, expanded,
+                            entry.messages, entry.tools_api, entry.tool_lookup,
+                        )
+                    else:
+                        console.print(f"  [red]Agent '{current_context}' not found. Switching to main.[/red]")
+                        current_context = "main"
+                        await agent.run(expanded, messages)
             except KeyboardInterrupt:
                 console.print("\n  [dim]Interrupted.[/dim]")
             except Exception as e:

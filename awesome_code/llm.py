@@ -1,5 +1,5 @@
 import os
-from openai import OpenAI
+from openai import AsyncOpenAI
 
 from awesome_code import config
 from awesome_code.tools import get_tools_for_api
@@ -19,7 +19,7 @@ Guidelines:
 - Use index_codebase if the user asks to index or if search_codebase returns no index
 - If a task requires multiple steps, execute them one by one
 - Be concise and direct
-{skills_section}"""
+{skills_section}{agents_section}"""
 
 
 def _build_skills_section() -> str:
@@ -42,7 +42,29 @@ def _build_skills_section() -> str:
     return "\n".join(lines)
 
 
-def get_client() -> OpenAI:
+def _build_agents_section() -> str:
+    from awesome_code.agents import list_agents
+
+    items = list_agents()
+    if not items:
+        return ""
+
+    lines = [
+        "\nAvailable sub-agents (use spawn_agent tool to delegate tasks):",
+    ]
+    for name, source, description in items:
+        lines.append(f"  - {name}: {description}")
+    lines.append(
+        "\nWhen a task can be delegated to a specialized sub-agent, use spawn_agent "
+        "to run it asynchronously. Sub-agents run in the background with a clean context. "
+        "The user sees live progress and a notification when the agent finishes. "
+        "After spawning, tell the user the agent is working and they can use /switch "
+        "to view results. Do NOT poll or check status — just spawn and move on."
+    )
+    return "\n".join(lines)
+
+
+def get_client() -> AsyncOpenAI:
     cfg = config.load()
     api_key = os.environ.get("OPENROUTER_API_KEY") or cfg.get("api_key")
     if not api_key:
@@ -51,7 +73,7 @@ def get_client() -> OpenAI:
             "Run `awesome-code --setup` or set OPENROUTER_API_KEY env var."
         )
     base_url = cfg.get("base_url", "https://openrouter.ai/api/v1")
-    return OpenAI(base_url=base_url, api_key=api_key)
+    return AsyncOpenAI(base_url=base_url, api_key=api_key)
 
 
 def get_model() -> str:
@@ -59,17 +81,27 @@ def get_model() -> str:
     return os.environ.get("AWESOME_CODE_MODEL") or cfg.get("model", "anthropic/claude-sonnet-4")
 
 
-def stream_response(client: OpenAI, messages: list[dict], on_text=None):
-    """Call LLM with streaming. Returns the complete assistant message (with tool_calls if any)."""
+async def stream_response(
+    client: AsyncOpenAI,
+    messages: list[dict],
+    on_text=None,
+    system_prompt: str | None = None,
+    tools_override: list[dict] | None = None,
+):
+    """Call LLM with async streaming. Returns the complete assistant message."""
     model = get_model()
-    tools = get_tools_for_api()
+    tools = tools_override if tools_override is not None else get_tools_for_api()
 
-    system_content = SYSTEM_PROMPT.format(
-        cwd=os.getcwd(),
-        skills_section=_build_skills_section(),
-    )
+    if system_prompt is not None:
+        system_content = system_prompt
+    else:
+        system_content = SYSTEM_PROMPT.format(
+            cwd=os.getcwd(),
+            skills_section=_build_skills_section(),
+            agents_section=_build_agents_section(),
+        )
 
-    stream = client.chat.completions.create(
+    stream = await client.chat.completions.create(
         model=model,
         messages=[
             {"role": "system", "content": system_content},
@@ -83,7 +115,7 @@ def stream_response(client: OpenAI, messages: list[dict], on_text=None):
     text_content = ""
     tool_calls_map: dict[int, dict] = {}
 
-    for chunk in stream:
+    async for chunk in stream:
         delta = chunk.choices[0].delta if chunk.choices else None
         if not delta:
             continue

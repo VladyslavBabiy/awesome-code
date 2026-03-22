@@ -6,10 +6,12 @@ from awesome_code.tools.list_dir import ListDirTool
 from awesome_code.tools.index_codebase import IndexCodebaseTool
 from awesome_code.tools.search_codebase import SearchCodebaseTool
 from awesome_code.tools.load_skill import LoadSkillTool
+from awesome_code.tools.spawn_agent import SpawnAgentTool
 
 _BUILTIN_TOOLS = [
     ReadFileTool(), WriteFileTool(), BashTool(), ListDirTool(),
     IndexCodebaseTool(), SearchCodebaseTool(), LoadSkillTool(),
+    SpawnAgentTool(),
 ]
 
 ALL_TOOLS: list[BaseTool] = list(_BUILTIN_TOOLS)
