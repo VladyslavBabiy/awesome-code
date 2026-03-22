@@ -2,7 +2,6 @@ import json
 
 from rich.console import Console
 from rich.panel import Panel
-from rich.syntax import Syntax
 
 from awesome_code.llm import get_client, stream_response
 from awesome_code.tools import TOOLS_BY_NAME
@@ -10,7 +9,7 @@ from awesome_code.tools import TOOLS_BY_NAME
 console = Console()
 
 
-def run(user_message: str, messages: list[dict]):
+async def run(user_message: str, messages: list[dict]):
     """Run the agent loop: send message, handle tool calls, repeat until done."""
     client = get_client()
     messages.append({"role": "user", "content": user_message})
@@ -49,7 +48,7 @@ def run(user_message: str, messages: list[dict]):
                         border_style="dim",
                     )
                 )
-                result = tool.execute(**fn_args)
+                result = await tool.execute_async(**fn_args)
 
                 # Show truncated result
                 preview = result[:500] + ("..." if len(result) > 500 else "")

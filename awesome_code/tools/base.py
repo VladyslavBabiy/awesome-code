@@ -19,3 +19,7 @@ class BaseTool(ABC):
     @abstractmethod
     def execute(self, **kwargs) -> str:
         ...
+
+    async def execute_async(self, **kwargs) -> str:
+        """Async execution. Default falls back to sync execute()."""
+        return self.execute(**kwargs)
