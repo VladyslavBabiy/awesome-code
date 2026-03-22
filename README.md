@@ -17,7 +17,7 @@ A CLI tool that lets you pair-program with LLMs right from your terminal — ask
 
 ---
 
-## Lesson 5: Sub-Agents
+## Lesson Sub-Agents
 
 ### The Problem
 
